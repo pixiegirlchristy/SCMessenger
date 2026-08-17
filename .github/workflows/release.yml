@@ -110,7 +110,7 @@ jobs:
           EOF
 
       - name: Upload Artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: cli-${{ matrix.target }}
           path: |
@@ -165,7 +165,7 @@ jobs:
           EOF
 
       - name: Upload Debug APK Artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: android-debug-apk
           path: |
@@ -213,7 +213,7 @@ jobs:
           test -n "$(find android/app/build/outputs/apk/release -type f -name '*.apk' -size +0c -print -quit)"
 
       - name: Upload signed release artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: android-release-signed
           path: |
@@ -322,7 +322,7 @@ jobs:
           EOF
 
       - name: Upload WASM Artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: wasm-release
           path: wasm/pkg/*
