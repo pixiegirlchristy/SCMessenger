@@ -119,4 +119,125 @@ final class OutboxRetryPolicyTests: XCTestCase {
             )
         )
     }
+
+    func testOutboundPresentationDistinguishesPendingAckAndReceipt() {
+        let now: UInt64 = 1_000
+
+        XCTAssertEqual(
+            MeshRepository.outboundDeliveryState(
+                messageDelivered: false,
+                messageStatus: .queued,
+                hasPendingEnvelope: false,
+                nowEpochSec: now
+            ),
+            .queued
+        )
+        XCTAssertEqual(
+            MeshRepository.outboundDeliveryState(
+                messageDelivered: false,
+                messageStatus: .queued,
+                hasPendingEnvelope: true,
+                nextAttemptAtEpochSec: now + 10,
+                nowEpochSec: now
+            ),
+            .stored
+        )
+        XCTAssertEqual(
+            MeshRepository.outboundDeliveryState(
+                messageDelivered: false,
+                messageStatus: .queued,
+                hasPendingEnvelope: true,
+                nextAttemptAtEpochSec: now,
+                nowEpochSec: now
+            ),
+            .forwarding
+        )
+        XCTAssertEqual(
+            MeshRepository.outboundDeliveryState(
+                messageDelivered: false,
+                messageStatus: .queued,
+                hasPendingEnvelope: true,
+                nextAttemptAtEpochSec: now + 60,
+                nowEpochSec: now,
+                ackedWithoutReceiptCount: 1
+            ),
+            .sent
+        )
+        XCTAssertEqual(
+            MeshRepository.outboundDeliveryState(
+                messageDelivered: true,
+                messageStatus: .sent,
+                hasPendingEnvelope: false,
+                nowEpochSec: now
+            ),
+            .delivered
+        )
+    }
+
+    func testAutomaticExhaustionIsRetryableButIdentityRejectionIsNot() {
+        let now: UInt64 = 1_000
+
+        XCTAssertEqual(
+            MeshRepository.outboundDeliveryState(
+                messageDelivered: false,
+                messageStatus: .queued,
+                hasPendingEnvelope: true,
+                nowEpochSec: now,
+                automaticRetryExhausted: true
+            ),
+            .failedRetryable
+        )
+        XCTAssertTrue(
+            MeshRepository.canManuallyRetry(
+                automaticRetryExhausted: true,
+                terminalFailureCode: nil
+            )
+        )
+        XCTAssertEqual(
+            MeshRepository.outboundDeliveryState(
+                messageDelivered: false,
+                messageStatus: .queued,
+                hasPendingEnvelope: true,
+                nowEpochSec: now,
+                automaticRetryExhausted: true,
+                terminalFailureCode: "identity_device_mismatch"
+            ),
+            .rejectedNonretryable
+        )
+        XCTAssertFalse(
+            MeshRepository.canManuallyRetry(
+                automaticRetryExhausted: true,
+                terminalFailureCode: "identity_device_mismatch"
+            )
+        )
+    }
+
+    func testManualRetryResetsTheExistingEnvelopeWithoutChangingHistoryIdentity() {
+        let original = MeshRepository.PendingOutboundEnvelope(
+            queueId: "queue-id",
+            historyRecordId: "history-id",
+            peerId: "peer-id",
+            routePeerId: "route-id",
+            addresses: ["/ip4/127.0.0.1/tcp/9001"],
+            envelopeBase64: "encrypted-envelope",
+            createdAtEpochSec: 100,
+            attemptCount: 12,
+            nextAttemptAtEpochSec: 200,
+            strictBleOnlyMode: false,
+            recipientIdentityId: "identity-id",
+            intendedDeviceId: "device-id",
+            terminalFailureCode: nil,
+            ackedWithoutReceiptCount: 0,
+            automaticRetryExhausted: true
+        )
+
+        let retried = original.resettingForManualRetry(at: 1_000)
+
+        XCTAssertEqual(retried.queueId, original.queueId)
+        XCTAssertEqual(retried.historyRecordId, original.historyRecordId)
+        XCTAssertEqual(retried.envelopeBase64, original.envelopeBase64)
+        XCTAssertEqual(retried.attemptCount, 0)
+        XCTAssertEqual(retried.nextAttemptAtEpochSec, 1_000)
+        XCTAssertNil(retried.automaticRetryExhausted)
+    }
 }
