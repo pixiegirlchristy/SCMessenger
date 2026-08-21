@@ -273,7 +273,7 @@ final class MeshRepository {
         let nickname: String?
     }
 
-    private struct PendingOutboundEnvelope: Codable {
+    struct PendingOutboundEnvelope: Codable {
         let queueId: String
         let historyRecordId: String
         let peerId: String
@@ -288,11 +288,67 @@ final class MeshRepository {
         let intendedDeviceId: String?
         let terminalFailureCode: String?
         var ackedWithoutReceiptCount: UInt32? = nil
+        var automaticRetryExhausted: Bool? = nil
+
+        func markingAutomaticRetryExhaustion(at nowEpochSec: UInt64) -> PendingOutboundEnvelope {
+            PendingOutboundEnvelope(
+                queueId: queueId,
+                historyRecordId: historyRecordId,
+                peerId: peerId,
+                routePeerId: routePeerId,
+                addresses: addresses,
+                envelopeBase64: envelopeBase64,
+                createdAtEpochSec: createdAtEpochSec,
+                attemptCount: attemptCount,
+                nextAttemptAtEpochSec: nowEpochSec,
+                strictBleOnlyMode: strictBleOnlyMode,
+                recipientIdentityId: recipientIdentityId,
+                intendedDeviceId: intendedDeviceId,
+                terminalFailureCode: terminalFailureCode,
+                ackedWithoutReceiptCount: ackedWithoutReceiptCount,
+                automaticRetryExhausted: true
+            )
+        }
+
+        func resettingForManualRetry(at nowEpochSec: UInt64) -> PendingOutboundEnvelope {
+            PendingOutboundEnvelope(
+                queueId: queueId,
+                historyRecordId: historyRecordId,
+                peerId: peerId,
+                routePeerId: routePeerId,
+                addresses: addresses,
+                envelopeBase64: envelopeBase64,
+                createdAtEpochSec: createdAtEpochSec,
+                attemptCount: 0,
+                nextAttemptAtEpochSec: nowEpochSec,
+                strictBleOnlyMode: strictBleOnlyMode,
+                recipientIdentityId: recipientIdentityId,
+                intendedDeviceId: intendedDeviceId,
+                terminalFailureCode: terminalFailureCode,
+                ackedWithoutReceiptCount: ackedWithoutReceiptCount,
+                automaticRetryExhausted: nil
+            )
+        }
     }
 
-    struct DeliveryStatePresentation {
+    enum OutboundDeliveryState: Equatable {
+        case queued
+        case stored
+        case forwarding
+        case sent
+        case delivered
+        case failedRetryable
+        case rejectedNonretryable
+    }
+
+    struct DeliveryStatePresentation: Equatable {
+        let state: OutboundDeliveryState
         let label: String
         let detail: String
+
+        var canRetry: Bool {
+            state == .failedRetryable
+        }
     }
 
     private struct MessageIdentityHints {
@@ -3368,46 +3424,84 @@ final class MeshRepository {
         return meshService?.getNatStatus() ?? "unknown"
     }
 
+    static func outboundDeliveryState(
+        messageDelivered: Bool,
+        messageStatus: MessageStatus,
+        hasPendingEnvelope: Bool,
+        nextAttemptAtEpochSec: UInt64? = nil,
+        nowEpochSec: UInt64,
+        ackedWithoutReceiptCount: UInt32 = 0,
+        automaticRetryExhausted: Bool = false,
+        terminalFailureCode: String? = nil
+    ) -> OutboundDeliveryState {
+        if messageDelivered || messageStatus == .delivered {
+            return .delivered
+        }
+        if terminalFailureCode != nil {
+            return .rejectedNonretryable
+        }
+        if automaticRetryExhausted {
+            return .failedRetryable
+        }
+        if ackedWithoutReceiptCount > 0 {
+            return .sent
+        }
+        if hasPendingEnvelope {
+            if let nextAttemptAtEpochSec, nextAttemptAtEpochSec <= nowEpochSec {
+                return .forwarding
+            }
+            return .stored
+        }
+        switch messageStatus {
+        case .queued:
+            return .queued
+        case .inCustody:
+            return .stored
+        case .sent:
+            return .sent
+        case .delivered:
+            return .delivered
+        }
+    }
+
+    static func canManuallyRetry(
+        automaticRetryExhausted: Bool,
+        terminalFailureCode: String?
+    ) -> Bool {
+        automaticRetryExhausted && terminalFailureCode == nil
+    }
+
     func deliveryStatePresentation(for message: MessageRecord, nowEpochSec: UInt64 = UInt64(Date().timeIntervalSince1970)) -> DeliveryStatePresentation {
-        if let pending = loadPendingOutbox().first(where: { $0.historyRecordId == message.id }) {
-            if let terminalFailureCode = pending.terminalFailureCode {
-                let detail: String
-                switch terminalFailureCode {
-                case "identity_device_mismatch":
-                    detail = "Rejected because this identity moved to another device. Refresh the contact before retrying."
-                case "identity_abandoned":
-                    detail = "Rejected because the contact abandoned this identity. Re-verify the contact before sending again."
-                default:
-                    detail = "Rejected because the recipient identity is no longer valid."
-                }
-                return DeliveryStatePresentation(
-                    label: "rejected",
-                    detail: detail
-                )
-            }
-            if pending.nextAttemptAtEpochSec <= nowEpochSec {
-                return DeliveryStatePresentation(
-                    label: "forwarding",
-                    detail: "Actively retrying through direct or relay paths."
-                )
-            }
-            return DeliveryStatePresentation(
-                label: "stored",
-                detail: "Stored for retry while the recipient is offline or unreachable."
-            )
-        }
-
-        if message.delivered {
-            return DeliveryStatePresentation(
-                label: "delivered",
-                detail: "Delivery receipt confirmed by the recipient node."
-            )
-        }
-
-        return DeliveryStatePresentation(
-            label: "pending",
-            detail: "Queued locally. First route attempt is still in progress."
+        let pending = loadPendingOutbox().first(where: { $0.historyRecordId == message.id })
+        let state = Self.outboundDeliveryState(
+            messageDelivered: message.delivered,
+            messageStatus: message.status,
+            hasPendingEnvelope: pending != nil,
+            nextAttemptAtEpochSec: pending?.nextAttemptAtEpochSec,
+            nowEpochSec: nowEpochSec,
+            ackedWithoutReceiptCount: pending?.ackedWithoutReceiptCount ?? 0,
+            automaticRetryExhausted: pending?.automaticRetryExhausted == true,
+            terminalFailureCode: pending?.terminalFailureCode
         )
+
+        switch state {
+        case .queued:
+            return DeliveryStatePresentation(state: state, label: "queued", detail: "Queued locally before a route attempt.")
+        case .stored:
+            return DeliveryStatePresentation(state: state, label: "stored", detail: "Stored for retry while the recipient is offline or unreachable.")
+        case .forwarding:
+            return DeliveryStatePresentation(state: state, label: "forwarding", detail: "Actively retrying through direct or relay paths.")
+        case .sent:
+            return DeliveryStatePresentation(state: state, label: "sent", detail: "Transport acknowledgement received; awaiting a delivery receipt.")
+        case .delivered:
+            return DeliveryStatePresentation(state: state, label: "delivered", detail: "Delivery receipt confirmed by the recipient node.")
+        case .failedRetryable:
+            return DeliveryStatePresentation(state: state, label: "failed-retryable", detail: "Automatic delivery attempts were exhausted. Retry reuses this encrypted envelope.")
+        case .rejectedNonretryable:
+            let detail = pending.map { terminalIdentityFailureMessage($0.terminalFailureCode) }
+                ?? "This message was rejected because the recipient identity is no longer valid."
+            return DeliveryStatePresentation(state: state, label: "rejected-nonretryable", detail: detail)
+        }
     }
 
     func exportDiagnostics() -> String {
@@ -3658,7 +3752,10 @@ final class MeshRepository {
 
     func getMessageRequests(limit: UInt32 = 100) -> [MessageRequestThread] {
         let contacts = (try? contactManager?.list()) ?? []
-        let pendingContacts = contacts.filter { isNotificationRequestPending(notes: $0.notes) }
+        let pendingContacts = contacts.filter { contact in
+            guard isNotificationRequestPending(notes: contact.notes) else { return false }
+            return (try? isPeerBlocked(peerId: contact.peerId)) != true
+        }
 
         return pendingContacts.compactMap { contact in
             let messages = (try? historyManager?.conversation(peerId: contact.peerId, limit: limit)) ?? []
@@ -3727,6 +3824,15 @@ final class MeshRepository {
     }
 
     func acceptMessageRequest(peerId: String) throws {
+        clearNotificationRequestPending(peerId: peerId)
+        NotificationManager.shared.markConversationRead(conversationId: peerId)
+    }
+
+    /// Reject a request only after the existing block authority accepts it.
+    /// A failed block deliberately leaves the marker intact so the request can
+    /// be retried rather than disappearing without an ingress policy change.
+    func rejectMessageRequest(peerId: String, reason: String? = nil) throws {
+        try blockPeer(peerId: peerId, reason: reason)
         clearNotificationRequestPending(peerId: peerId)
         NotificationManager.shared.markConversationRead(conversationId: peerId)
     }
@@ -5605,19 +5711,25 @@ final class MeshRepository {
                 nowEpochSec: now,
                 maxAgeSeconds: pendingOutboxMaxAgeSeconds
             ) {
+                nextQueue.append(item)
                 appendDiagnostic(
-                    "delivery_state msg=\(item.historyRecordId) state=delivered_unconfirmed detail=stopped_pending_outbox reason=max_age_exceeded_acked_without_receipt acked_without_receipt=\(ackedWithoutReceiptCount)"
-                )
-                continue
-            }
-            if let expiryReason = pendingOutboxExpiryReason(for: item, nowEpochSec: now) {
-                appendDiagnostic(
-                    "delivery_state msg=\(item.historyRecordId) state=failed detail=dropped_pending_outbox reason=\(expiryReason) attempt=\(item.attemptCount)"
+                    "delivery_state msg=\(item.historyRecordId) state=sent detail=stopped_pending_outbox reason=max_age_exceeded_acked_without_receipt acked_without_receipt=\(ackedWithoutReceiptCount)"
                 )
                 continue
             }
             if item.terminalFailureCode != nil {
                 nextQueue.append(item)
+                continue
+            }
+            if item.automaticRetryExhausted == true {
+                nextQueue.append(item)
+                continue
+            }
+            if let expiryReason = pendingOutboxExpiryReason(for: item, nowEpochSec: now) {
+                nextQueue.append(item.markingAutomaticRetryExhaustion(at: now))
+                appendDiagnostic(
+                    "delivery_state msg=\(item.historyRecordId) state=failed_retryable detail=automatic_attempts_exhausted reason=\(expiryReason) attempt=\(item.attemptCount)"
+                )
                 continue
             }
             if item.nextAttemptAtEpochSec > now {
@@ -5686,7 +5798,8 @@ final class MeshRepository {
                         recipientIdentityId: item.recipientIdentityId,
                         intendedDeviceId: item.intendedDeviceId,
                         terminalFailureCode: terminalFailureCode,
-                        ackedWithoutReceiptCount: item.ackedWithoutReceiptCount
+                        ackedWithoutReceiptCount: item.ackedWithoutReceiptCount,
+                        automaticRetryExhausted: item.automaticRetryExhausted
                     )
                 )
                 appendDiagnostic("delivery_state msg=\(item.historyRecordId) state=rejected detail=terminal_failure_code=\(terminalFailureCode)")
@@ -5715,7 +5828,8 @@ final class MeshRepository {
                         recipientIdentityId: item.recipientIdentityId,
                         intendedDeviceId: item.intendedDeviceId,
                         terminalFailureCode: item.terminalFailureCode,
-                        ackedWithoutReceiptCount: nextAckedWithoutReceiptCount
+                        ackedWithoutReceiptCount: nextAckedWithoutReceiptCount,
+                        automaticRetryExhausted: item.automaticRetryExhausted
                     )
                 )
                 appendDiagnostic("delivery_state msg=\(item.historyRecordId) state=stored detail=awaiting_receipt_delay_sec=\(adaptiveReceiptWait) acked_without_receipt=\(nextAckedWithoutReceiptCount)")
@@ -5750,7 +5864,8 @@ final class MeshRepository {
                         recipientIdentityId: item.recipientIdentityId,
                         intendedDeviceId: item.intendedDeviceId,
                         terminalFailureCode: item.terminalFailureCode,
-                        ackedWithoutReceiptCount: item.ackedWithoutReceiptCount
+                        ackedWithoutReceiptCount: item.ackedWithoutReceiptCount,
+                        automaticRetryExhausted: item.automaticRetryExhausted
                     )
             )
             appendDiagnostic("delivery_state msg=\(item.historyRecordId) state=stored detail=retry_backoff_sec=\(backoff) attempt=\(nextAttemptCount)")
@@ -5770,12 +5885,15 @@ final class MeshRepository {
         return decoded
     }
 
-    private func savePendingOutbox(_ queue: [PendingOutboundEnvelope]) {
+    @discardableResult
+    private func savePendingOutbox(_ queue: [PendingOutboundEnvelope]) -> Bool {
         do {
             let data = try JSONEncoder().encode(queue)
             try data.write(to: pendingOutboxURL, options: .atomic)
+            return true
         } catch {
             logger.warning("Failed to persist pending outbox: \(error.localizedDescription)")
+            return false
         }
     }
 
@@ -5796,6 +5914,35 @@ final class MeshRepository {
         let filtered = queue.filter { $0.historyRecordId != historyRecordId }
         guard filtered.count != queue.count else { return }
         savePendingOutbox(filtered)
+    }
+
+    /// Requeue the existing encrypted envelope after automatic attempts have
+    /// stopped. Terminal identity/device failures intentionally remain intact.
+    @discardableResult
+    func retryFailedMessage(messageId: String) -> Bool {
+        let normalizedMessageId = messageId.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !normalizedMessageId.isEmpty else { return false }
+
+        var queue = loadPendingOutbox()
+        guard let index = queue.firstIndex(where: { $0.historyRecordId == normalizedMessageId }) else {
+            return false
+        }
+        let pending = queue[index]
+        guard Self.canManuallyRetry(
+            automaticRetryExhausted: pending.automaticRetryExhausted == true,
+            terminalFailureCode: pending.terminalFailureCode
+        ) else {
+            return false
+        }
+
+        queue[index] = pending.resettingForManualRetry(at: UInt64(Date().timeIntervalSince1970))
+        guard savePendingOutbox(queue) else { return false }
+        if let updated = try? historyManager?.get(id: normalizedMessageId) {
+            messageUpdates.send(updated)
+        }
+        appendDiagnostic("delivery_state msg=\(normalizedMessageId) state=forwarding detail=manual_retry_scheduled")
+        dispatchFlushPendingOutbox(reason: "manual_retry")
+        return true
     }
 
     private func triggerPendingSyncForPeerIds(_ peerIds: [String], reason: String) {

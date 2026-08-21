@@ -113,6 +113,17 @@ final class ChatViewModel {
         }
     }
 
+    func deliveryStatePresentation(for message: MessageRecord) -> MeshRepository.DeliveryStatePresentation? {
+        repository?.deliveryStatePresentation(for: message)
+    }
+
+    func retryMessage(id: String) {
+        guard repository?.retryFailedMessage(messageId: id) == true else {
+            return
+        }
+        error = nil
+    }
+
     private var reloadDebounceTask: Task<Void, Never>?
 
     private func subscribeToNewMessages() {
